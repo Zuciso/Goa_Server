@@ -1,0 +1,16 @@
+# Ignore .env files
+.env
+
+# Ignore Docker-related files
+docker-compose.override.yml
+docker-compose.yml
+*.log
+mysql_data/
+
+# Ignore Go build artifacts
+*.exe
+*.exe~
+*.so
+*.dylib
+*.test
+
