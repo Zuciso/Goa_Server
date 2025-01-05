@@ -1,0 +1,35 @@
+version: '3.9'
+
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: mysql_container
+    restart: always
+    environment:
+      MYSQL_ROOT_PASSWORD: 12QWaszx
+      MYSQL_DATABASE: bhavik
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+
+  go_server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: go_server
+    depends_on:
+      - mysql
+    ports:
+      - "8080:8080"
+    environment:
+      DB_HOST: mysql_container
+      DB_USER: root
+      DB_PASSWORD: 12QWaszx
+      DB_NAME: bhavik
+    volumes:
+      - .:/app
+
+volumes:
+  mysql_data:
+
