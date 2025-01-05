@@ -1,163 +1,175 @@
 package main
 
 import (
-	"encoding/json"
+	"context" // For context handling in the middleware
+	"encoding/json" // For JSON encoding/decoding
 	"fmt"
 	"log"
 	"net/http"
 	"os"
-	"strconv"
+	"strings"
+	"time"
 
+	"github.com/dgrijalva/jwt-go"
 	"github.com/gorilla/mux"
 	"gorm.io/driver/mysql"
 	"gorm.io/gorm"
 )
 
-// User represents the user model
+var jwtKey = []byte("your_secret_key")
+
+// User struct for DB
 type User struct {
-	ID    uint   `gorm:"primaryKey" json:"id"`
-	Name  string `json:"name"`
+	ID       uint   `gorm:"primaryKey"`
+	Name     string
+	Email    string `gorm:"unique"`
+	Password string
+}
+
+// Claims struct to handle JWT claims
+type Claims struct {
 	Email string `json:"email"`
+	jwt.StandardClaims
 }
 
-var db *gorm.DB
+// Initialize the database connection
+func initDB() (*gorm.DB, error) {
+	dbHost := os.Getenv("DB_HOST")
+	dbUser := os.Getenv("DB_USER")
+	dbPassword := os.Getenv("DB_PASSWORD")
+	dbName := os.Getenv("DB_NAME")
 
-func main() {
-	// Retrieve environment variables
-	dbHost := os.Getenv("DB_HOST")        // Should be 'mysql_container'
-	dbUser := os.Getenv("DB_USER")        // Should be 'root'
-	dbPassword := os.Getenv("DB_PASSWORD") // MySQL root password
-	dbName := os.Getenv("DB_NAME")        // Database name
-
-	// Build the DSN string for MySQL
 	dsn := fmt.Sprintf("%s:%s@tcp(%s:3306)/%s?charset=utf8mb4&parseTime=True&loc=Local", dbUser, dbPassword, dbHost, dbName)
-
-	// Open a connection to the MySQL database
-	var err error
-	db, err = gorm.Open(mysql.Open(dsn), &gorm.Config{})
+	db, err := gorm.Open(mysql.Open(dsn), &gorm.Config{})
 	if err != nil {
-		log.Fatalf("Failed to connect to the database: %v", err)
+		return nil, err
 	}
 
-	// Ensure the 'users' table exists
-	log.Println("Checking if the 'users' table exists...")
-	if db.Migrator().HasTable(&User{}) {
-		log.Println("'users' table already exists.")
-	} else {
-		log.Println("'users' table does not exist. Creating it now...")
-		if err := db.AutoMigrate(&User{}); err != nil {
-			log.Fatalf("Failed to create the 'users' table: %v", err)
-		}
-		log.Println("'users' table created successfully!")
-	}
-
-	// Initialize the router
-	router := mux.NewRouter()
-
-	// Define API routes
-	router.HandleFunc("/users", createUser).Methods("POST")
-	router.HandleFunc("/users", getUsers).Methods("GET")
-	router.HandleFunc("/users/{id}", getUser).Methods("GET")
-	router.HandleFunc("/users/{id}", updateUser).Methods("PUT")
-	router.HandleFunc("/users/{id}", deleteUser).Methods("DELETE")
-
-	// Start the server
-	log.Println("Starting server on port 8080...")
-	log.Fatal(http.ListenAndServe(":8080", router))
+	// Migrate the schema
+	db.AutoMigrate(&User{})
+	return db, nil
 }
 
-// createUser handles POST /users
-func createUser(w http.ResponseWriter, r *http.Request) {
+// Middleware to verify JWT token
+func authenticateJWT(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		tokenString := r.Header.Get("Authorization")
+		tokenString = strings.TrimPrefix(tokenString, "Bearer ")
+
+		if tokenString == "" {
+			http.Error(w, "Missing token", http.StatusUnauthorized)
+			return
+		}
+
+		claims := &Claims{}
+		token, err := jwt.ParseWithClaims(tokenString, claims, func(token *jwt.Token) (interface{}, error) {
+			return jwtKey, nil
+		})
+
+		if err != nil || !token.Valid {
+			http.Error(w, "Invalid token", http.StatusUnauthorized)
+			return
+		}
+
+		// Add claims to the request context for use in handlers
+		r = r.WithContext(context.WithValue(r.Context(), "email", claims.Email))
+
+		next.ServeHTTP(w, r)
+	})
+}
+
+// Generate JWT token
+func generateJWT(email string) (string, error) {
+	expirationTime := time.Now().Add(24 * time.Hour)
+	claims := &Claims{
+		Email: email,
+		StandardClaims: jwt.StandardClaims{
+			ExpiresAt: expirationTime.Unix(),
+		},
+	}
+
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	return token.SignedString(jwtKey)
+}
+
+// Register user (for demo purposes, we are storing password in plain text - Use hashing for production!)
+func registerUser(w http.ResponseWriter, r *http.Request) {
+	db, err := initDB()
+	if err != nil {
+		http.Error(w, "Failed to connect to database", http.StatusInternalServerError)
+		return
+	}
+
 	var user User
 	if err := json.NewDecoder(r.Body).Decode(&user); err != nil {
 		http.Error(w, "Invalid input", http.StatusBadRequest)
 		return
 	}
 
+	// Store user
 	if err := db.Create(&user).Error; err != nil {
-		http.Error(w, "Failed to create user", http.StatusInternalServerError)
+		http.Error(w, "Failed to register user", http.StatusInternalServerError)
 		return
 	}
 
 	w.WriteHeader(http.StatusCreated)
-	json.NewEncoder(w).Encode(user)
 }
 
-// getUsers handles GET /users
-func getUsers(w http.ResponseWriter, r *http.Request) {
-	var users []User
-	if err := db.Find(&users).Error; err != nil {
-		http.Error(w, "Failed to retrieve users", http.StatusInternalServerError)
-		return
-	}
-
-	json.NewEncoder(w).Encode(users)
-}
-
-// getUser handles GET /users/{id}
-func getUser(w http.ResponseWriter, r *http.Request) {
-	params := mux.Vars(r)
-	id, err := strconv.Atoi(params["id"])
+// Login user and generate JWT
+func loginUser(w http.ResponseWriter, r *http.Request) {
+	db, err := initDB()
 	if err != nil {
-		http.Error(w, "Invalid user ID", http.StatusBadRequest)
+		http.Error(w, "Failed to connect to database", http.StatusInternalServerError)
 		return
 	}
 
 	var user User
-	if err := db.First(&user, id).Error; err != nil {
-		http.Error(w, "User not found", http.StatusNotFound)
-		return
-	}
-
-	json.NewEncoder(w).Encode(user)
-}
-
-// updateUser handles PUT /users/{id}
-func updateUser(w http.ResponseWriter, r *http.Request) {
-	params := mux.Vars(r)
-	id, err := strconv.Atoi(params["id"])
-	if err != nil {
-		http.Error(w, "Invalid user ID", http.StatusBadRequest)
-		return
-	}
-
-	var user User
-	if err := db.First(&user, id).Error; err != nil {
-		http.Error(w, "User not found", http.StatusNotFound)
-		return
-	}
-
-	var updatedData User
-	if err := json.NewDecoder(r.Body).Decode(&updatedData); err != nil {
+	if err := json.NewDecoder(r.Body).Decode(&user); err != nil {
 		http.Error(w, "Invalid input", http.StatusBadRequest)
 		return
 	}
 
-	user.Name = updatedData.Name
-	user.Email = updatedData.Email
-
-	if err := db.Save(&user).Error; err != nil {
-		http.Error(w, "Failed to update user", http.StatusInternalServerError)
+	var storedUser User
+	if err := db.Where("email = ?", user.Email).First(&storedUser).Error; err != nil {
+		http.Error(w, "Invalid credentials", http.StatusUnauthorized)
 		return
 	}
 
-	json.NewEncoder(w).Encode(user)
+	// In a production app, use hashed passwords instead of plain text
+	if storedUser.Password != user.Password {
+		http.Error(w, "Invalid credentials", http.StatusUnauthorized)
+		return
+	}
+
+	tokenString, err := generateJWT(user.Email)
+	if err != nil {
+		http.Error(w, "Failed to generate token", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Authorization", "Bearer "+tokenString)
+	w.WriteHeader(http.StatusOK)
 }
 
-// deleteUser handles DELETE /users/{id}
-func deleteUser(w http.ResponseWriter, r *http.Request) {
-	params := mux.Vars(r)
-	id, err := strconv.Atoi(params["id"])
-	if err != nil {
-		http.Error(w, "Invalid user ID", http.StatusBadRequest)
-		return
-	}
+// Get user info (protected route)
+func getUserInfo(w http.ResponseWriter, r *http.Request) {
+	email := r.Context().Value("email").(string)
+	w.Write([]byte(fmt.Sprintf("User info for %s", email)))
+}
 
-	if err := db.Delete(&User{}, id).Error; err != nil {
-		http.Error(w, "Failed to delete user", http.StatusInternalServerError)
-		return
-	}
+func main() {
+	r := mux.NewRouter()
 
-	w.WriteHeader(http.StatusNoContent)
+	// Public routes
+	r.HandleFunc("/register", registerUser).Methods("POST")
+	r.HandleFunc("/login", loginUser).Methods("POST")
+
+	// Protected routes
+	r.Handle("/userinfo", authenticateJWT(http.HandlerFunc(getUserInfo))).Methods("GET")
+
+	http.Handle("/", r)
+
+	log.Println("Server started on :8080")
+	log.Fatal(http.ListenAndServe(":8080", nil))
 }
 
